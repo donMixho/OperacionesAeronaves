@@ -14,6 +14,7 @@
 - [Analisis Exploratorio — Graficos clave](#analisis-exploratorio--graficos-clave)
 - [Modelado No Supervisado — Clustering](#modelado-no-supervisado--clustering)
 - [Modelado Supervisado — Clasificacion](#modelado-supervisado--clasificacion)
+- [Sistema de Alerta Temprana de Retrasos — SCTE (Nowcasting)](#sistema-de-alerta-temprana-de-retrasos--scte-nowcasting)
 - [Conclusiones y Decisiones de Negocio](#conclusiones-y-decisiones-de-negocio)
 - [Estructura del proyecto](#estructura-del-proyecto)
 
@@ -61,6 +62,7 @@ join_con_aeropuertos       ← une con estadisticas mensuales por aeropuerto
 | `data_inventory` | Inventario de archivos en `data/01_raw/` |
 | `data_processing` | Limpieza, JOIN y EDA basico |
 | `ml` | EDA avanzado, clustering y clasificacion |
+| `retrasos_ml` | Modelo tactico de riesgo de retraso para SCTE (PoC) |
 
 ---
 
@@ -78,6 +80,7 @@ uv run kedro run
 # O por partes
 uv run kedro run --pipeline=data_processing
 uv run kedro run --pipeline=ml
+uv run kedro run --pipeline=retrasos_ml
 ```
 
 > **Semilla fija:** todos los modelos usan `random_state=42` para garantizar resultados identicos entre ejecuciones.
@@ -86,7 +89,7 @@ uv run kedro run --pipeline=ml
 
 ## Preparacion de los datos
 
-Las dos fuentes crudas tienen problemas tipicos de datos reales. Asi los resolvimos:
+Las fuentes de datos del proyecto cubren operaciones aereas y condiciones meteorologicas. Asi se procesaron:
 
 **`bitacora-vuelos.parquet`** — 11 074 197 filas, 12 columnas
 
@@ -200,6 +203,97 @@ Probamos k=2 hasta k=8. El optimo matematico es **k=4** — mayor Silhouette Sco
 
 ---
 
+## Sistema de Alerta Temprana de Retrasos — SCTE (Nowcasting)
+
+### Objetivo y Alcance
+
+El aeropuerto El Tepual de Puerto Montt (SCTE) es el punto de la red JAC con mayor exposicion a fenomenos meteorologicos adversos: lluvia persistente, viento sur fuerte y rafagas son eventos frecuentes que derivan en retrasos operacionales superiores a 15 minutos.
+
+Este modulo implementa un **Sistema de Alerta Temprana (Nowcasting tactico)** con una **ventana de anticipacion de hasta 3 horas**. Su objetivo es generar un score de probabilidad de retraso por vuelo que permita a la gerencia aeroportuaria y al equipo de operaciones tomar decisiones preventivas antes de que el problema ocurra: reasignacion de gates, coordinacion con aerolineas, activacion de contingencias y comunicacion anticipada a pasajeros.
+
+### Fuente de Datos Meteorologicos
+
+Los datos climaticos historicos **horarios** del periodo **2020–2026** fueron extraidos directamente desde la API de Open-Meteo para la coordenada de El Tepual (latitud -41.4693, longitud -72.9424):
+
+| Variable | Descripcion |
+|---|---|
+| `temperatura` | Temperatura del aire a 2 metros (°C) |
+| `precipitacion` | Precipitacion acumulada por hora (mm) |
+| `veloc_viento` | Velocidad del viento a 10 metros (km/h) |
+| `rafagas_viento` | Rafagas maximas de viento (km/h) |
+| `codigo_clima` | Codigo WMO de condicion meteorologica |
+| `humedad` | Humedad relativa (%) |
+
+**Fuente oficial de extraccion:**
+[Open-Meteo Historical Weather API - Puerto Montt SCTE](https://open-meteo.com/en/docs/historical-weather-api?latitude=-41.4693&longitude=-72.9424&start_date=2020-01-01&end_date=2026-01-01&hourly=temperature_2m,precipitation,wind_speed_10m,wind_gusts_10m,weather_code,relative_humidity_2m)
+
+Los datos se unen a la bitacora de vuelos SCTE por hora exacta (`dt_operacion` redondeado a la hora). La cobertura meteorologica alcanza el **89.9%** para el periodo 2020–2026 (104 476 vuelos con datos de clima sobre 426 547 vuelos SCTE totales en el registro historico).
+
+### Metodologia y Decisiones Tecnicas
+
+**Ingenieria de la variable objetivo**
+
+La variable objetivo `adverso_t3` representa si existira una condicion meteorologica adversa **3 horas despues** del instante de prediccion. Esta logica de horizonte t+3 es lo que le da al modelo su capacidad de anticipacion: las features son el clima *ahora*, y el target es lo que pasara *despues*. Una condicion se considera adversa si cumple al menos uno de los siguientes criterios operacionales:
+
+- Viento sostenido > 25 km/h
+- Rafagas > 35 km/h
+- Precipitacion acumulada en la hora > 5 mm
+- Codigo WMO de tormenta, lluvia intensa, nieve o cizalladura (codigos 55, 61–65, 71–77, 80–86, 95–99)
+
+**Reproducibilidad**
+
+Se configuro explicitamente `random_state=42` en el RandomForestClassifier y en la validacion cruzada estratificada (StratifiedKFold). Esto garantiza que cualquier ejecucion del pipeline `retrasos_ml` produce exactamente los mismos resultados numericos, independientemente del entorno o la maquina.
+
+**Split temporal estricto (sin data leakage)**
+
+Para evitar fuga de datos y evaluar el modelo tal como operaria en produccion, se implemento una validacion temporal rigurosa:
+
+- **Entrenamiento:** datos del periodo 2020–2024 (75 223 vuelos con clima)
+- **Evaluacion y score:** datos del periodo 2025–2026 (29 253 vuelos, nunca vistos por el modelo)
+
+Este tipo de split es mas exigente que un split aleatorio: el modelo debe generalizar a condiciones futuras, no solo a datos mezclados en el tiempo.
+
+### Resultados del Modelo
+
+**RandomForestClassifier** — 200 arboles, profundidad maxima 10, `class_weight="balanced"`, `random_state=42`.
+
+| Metrica | Valor | Interpretacion |
+|---|---|---|
+| **ROC-AUC (Test 2025-2026)** | **0.9335** | Excelente discriminacion en datos no vistos |
+| **ROC-AUC (CV-5, Train)** | 0.9579 ± 0.0016 | Consistente en validacion cruzada interna |
+| **Accuracy** | 0.8758 | 87.6% de predicciones correctas |
+| **Precision** | 0.8718 | De cada 10 alertas emitidas, ~9 son condiciones adversas reales |
+| **Recall** | 0.7741 | Detecta el 77.4% de los episodios adversos reales |
+| **F1-Score** | 0.8200 | Balance solido entre precision y cobertura |
+
+> La alta Precision (0.87) es critica en este contexto operacional: genera pocas falsas alarmas, lo que mantiene la credibilidad del sistema de alerta frente a los operadores. El Recall de 0.77 significa que aproximadamente 1 de cada 4 episodios adversos reales no es detectado — margen aceptable para una PoC, mejorable incorporando datos de pronostico meteorologico (NWP) en el futuro.
+
+### Tabla de Alerta Operativa (Score 2025-2026)
+
+El artefacto principal del pipeline es `data/07_model_output/score_riesgo_operativo_scte.csv`. Cada fila corresponde a un vuelo en SCTE con su probabilidad de condicion adversa en las proximas 3 horas y una alerta de color para accion inmediata:
+
+| Alerta_Operativa | Probabilidad | Vuelos 2025-2026 | Accion recomendada |
+|---|---|---|---|
+| **Verde (Operacion Normal)** | < 30% | **10 777** (57.7%) | Sin accion. Condiciones dentro de parametros normales |
+| **Amarillo (Monitoreo Preventivo)** | 30% – 70% | **3 466** (18.6%) | Revisar NOTAM, coordinar alternativas, activar protocolo preventivo |
+| **Rojo (Alerta de Retraso)** | > 70% | **4 451** (23.8%) | Activar protocolo de contingencia. Evaluar postergacion o desvio |
+
+Para ejecutar solo este pipeline:
+
+```bash
+uv run kedro run --pipeline=retrasos_ml
+```
+
+El modelo serializado queda en `data/06_models/retrasos_scte.pkl` y se puede cargar sin re-entrenar:
+
+```python
+import joblib
+modelo = joblib.load("data/06_models/retrasos_scte.pkl")
+prob = modelo.predict_proba(X_nuevo)[:, 1]
+```
+
+---
+
 ## Conclusiones y Decisiones de Negocio
 
 **1. El sistema aereo chileno es un monocentro.**
@@ -228,7 +322,8 @@ OperacionesAeronaves/
 │   ├── 01_raw/          ← fuentes originales (no versionadas)
 │   ├── 02_intermediate/ ← datos en transformacion
 │   ├── 03_primary/      ← dato integrado listo para ML (vuelos_con_operaciones.parquet)
-│   ├── 06_models/       ← modelos entrenados (random_forest.pkl, kmeans.pkl)
+│   ├── 06_models/       ← modelos entrenados (random_forest.pkl, kmeans.pkl, retrasos_scte.pkl)
+│   ├── 07_model_output/ ← score_riesgo_operativo_scte.csv (tabla de alertas)
 │   └── 08_reporting/    ← reportes de inventario
 │
 ├── images/              ← graficos EDA y ML generados automaticamente
@@ -236,7 +331,8 @@ OperacionesAeronaves/
 ├── src/modelo_ml_waymo/pipelines/
 │   ├── data_inventory/  ← escaneo de archivos raw
 │   ├── data_processing/ ← limpieza, JOIN y EDA basico
-│   └── ml/              ← EDA avanzado, clustering y clasificacion
+│   ├── ml/              ← EDA avanzado, clustering y clasificacion
+│   └── retrasos_ml/     ← nowcasting tactico de retrasos para SCTE
 │
 ├── conf/base/
 │   ├── catalog.yml      ← registro de todos los datasets

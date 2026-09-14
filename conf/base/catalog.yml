@@ -26,6 +26,34 @@ data_inventory_report_md:
     open_args_save: { mode: w, encoding: utf-8 }
     open_args_load: { mode: r, encoding: utf-8 }
 
+# --- retrasos_ml pipeline -----------------------------------------------------
+# Modelo tactico de riesgo de retraso para SCTE (Puerto Montt - El Tepual).
+# Datos meteorologicos historicos horarios 2020-2026 extraidos de Open-Meteo.
+# See src/modelo_ml_waymo/pipelines/retrasos_ml.
+
+clima_raw:
+  type: pandas.CSVDataset
+  filepath: data/01_raw/open_meteo_weather.csv
+
+scte_vuelos_clima:
+  type: pandas.ParquetDataset
+  filepath: data/02_intermediate/scte_vuelos_clima.parquet
+
+metricas_retrasos:
+  type: pandas.ParquetDataset
+  filepath: data/02_intermediate/metricas_retrasos.parquet
+
+modelo_retrasos_scte:
+  type: pickle.PickleDataset
+  filepath: data/06_models/retrasos_scte.pkl
+  backend: joblib
+
+score_riesgo_scte:
+  type: pandas.CSVDataset
+  filepath: data/07_model_output/score_riesgo_operativo_scte.csv
+  save_args:
+    index: false
+
 # --- data_processing pipeline -------------------------------------------------
 # Ingesta, limpieza, integracion y EDA basico de datos aeronauticos JAC.
 # See src/modelo_ml_waymo/pipelines/data_processing.
