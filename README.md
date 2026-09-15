@@ -229,6 +229,46 @@ Los datos climaticos historicos **horarios** del periodo **2020–2026** fueron 
 
 Los datos se unen a la bitacora de vuelos SCTE por hora exacta (`dt_operacion` redondeado a la hora). La cobertura meteorologica alcanza el **89.9%** para el periodo 2020–2026 (104 476 vuelos con datos de clima sobre 426 547 vuelos SCTE totales en el registro historico).
 
+### Como se integran los datasets
+
+El siguiente diagrama muestra el flujo exacto dentro del nodo `preparar_datos_scte`: de donde viene cada columna, en que orden se procesan y que sale al final.
+
+```mermaid
+flowchart TD
+    A[("`**bitacora-vuelos.parquet**
+    Operacional: avión, hora`")] -->|Ruta 1| JOIN
+    B[("`**open_meteo_weather.csv**
+    Clima horario t₀`")] -->|Ruta 2| CT
+
+    subgraph N1["  Nodo 1: preparar_datos_scte  "]
+        CT["🔷 Cálculo Target
+        adverso_t3 = shift(–3)
+        ANTES del JOIN"]
+
+        JOIN{{"JOIN por
+        'hora_dt'"}}
+
+        CT --> JOIN
+
+        subgraph FE["  Ingeniería de Features v2  "]
+            direction LR
+            F1["aerolinea_te
+            fit solo en train"]
+            F2["vuelos_hora
+            conteo por hora"]
+            F3["pmd_norm
+            desde pmd del vuelo"]
+        end
+
+        JOIN --> FE
+    end
+
+    FE --> OUT[("`**scte_vuelos_clima.parquet**
+    Vuelo + Clima t₀ + Target t+3`")]
+```
+
+> **Por qué el target se calcula ANTES del JOIN:** si se calculara después, el `shift(–3)` podría desalinearse al haber filas duplicadas por vuelo. Aplicarlo directamente sobre la tabla de clima ordenada cronológicamente garantiza que `adverso_t3[i]` siempre corresponde a la condición meteorológica exactamente 3 horas después de `hora_dt[i]`.
+
 ### Metodologia y Decisiones Tecnicas
 
 **Ingenieria de la variable objetivo**
@@ -240,43 +280,40 @@ La variable objetivo `adverso_t3` representa si existira una condicion meteorolo
 - Precipitacion acumulada en la hora > 5 mm
 - Codigo WMO de tormenta, lluvia intensa, nieve o cizalladura (codigos 55, 61–65, 71–77, 80–86, 95–99)
 
-**Reproducibilidad**
+**Ingeniería de Características y Prevención de Fuga (Data Leakage)**
 
-Se configuro explicitamente `random_state=42` en el RandomForestClassifier y en la validacion cruzada estratificada (StratifiedKFold). Esto garantiza que cualquier ejecucion del pipeline `retrasos_ml` produce exactamente los mismos resultados numericos, independientemente del entorno o la maquina.
+Además de las variables meteorológicas crudas, el modelo incorpora **features operativas** derivadas de la bitácora: nivel de congestión (vuelos por hora), peso normalizado de la aeronave (PMD) y perfil de riesgo de la aerolínea (Target Encoding).
 
-**Split temporal estricto (sin data leakage)**
+Para garantizar que el modelo aprenda patrones reales y no caiga en la "autocorrelación meteorológica" (aprender simplemente que si llueve ahora, lloverá en 3 horas), se implementó una estricta auditoría automática de *leakage* antes del entrenamiento, asegurando que ninguna variable en $t_0$ contenga información del futuro.
 
-Para evitar fuga de datos y evaluar el modelo tal como operaria en produccion, se implemento una validacion temporal rigurosa:
+**Validación Temporal Estricta y Algoritmo**
 
-- **Entrenamiento:** datos del periodo 2020–2024 (75 223 vuelos con clima)
-- **Evaluacion y score:** datos del periodo 2025–2026 (29 253 vuelos, nunca vistos por el modelo)
-
-Este tipo de split es mas exigente que un split aleatorio: el modelo debe generalizar a condiciones futuras, no solo a datos mezclados en el tiempo.
+El modelo utiliza **LightGBM**, elegido por su capacidad nativa para manejar valores nulos (esencial para los PMD faltantes) y su velocidad con bases de datos grandes. Para la validación, se abandonó el tradicional k-fold estratificado en favor de un **TimeSeriesSplit (5 particiones)**. Esto es crítico: evita inflar las métricas prediciendo el pasado con datos del futuro, reflejando el rendimiento real esperado en producción.
+- **Entrenamiento:** 2020–2024 (75.223 vuelos)
+- **Score (Datos no vistos):** 2025–2026 (29.253 vuelos)
 
 ### Resultados del Modelo
 
-**RandomForestClassifier** — 200 arboles, profundidad maxima 10, `class_weight="balanced"`, `random_state=42`.
+**LightGBM Classifier** — TimeSeriesSplit (5-folds), Horizonte 3 horas, 15 Features.
 
-| Metrica | Valor | Interpretacion |
+| Métrica | Valor | Interpretación |
 |---|---|---|
-| **ROC-AUC (Test 2025-2026)** | **0.9335** | Excelente discriminacion en datos no vistos |
-| **ROC-AUC (CV-5, Train)** | 0.9579 ± 0.0016 | Consistente en validacion cruzada interna |
-| **Accuracy** | 0.8758 | 87.6% de predicciones correctas |
-| **Precision** | 0.8718 | De cada 10 alertas emitidas, ~9 son condiciones adversas reales |
-| **Recall** | 0.7741 | Detecta el 77.4% de los episodios adversos reales |
-| **F1-Score** | 0.8200 | Balance solido entre precision y cobertura |
-
-> La alta Precision (0.87) es critica en este contexto operacional: genera pocas falsas alarmas, lo que mantiene la credibilidad del sistema de alerta frente a los operadores. El Recall de 0.77 significa que aproximadamente 1 de cada 4 episodios adversos reales no es detectado — margen aceptable para una PoC, mejorable incorporando datos de pronostico meteorologico (NWP) en el futuro.
+| **ROC-AUC (Test 2025-2026)** | **0.9280** | Excelente discriminación real en datos futuros |
+| **ROC-AUC (CV-5 Temporal)** | 0.9261 ± 0.01 | Extremadamente estable y sin sobreajuste |
+| **Accuracy** | 0.8647 | 86.5% de predicciones correctas |
+| **Precision** | 0.8731 | De cada 10 alertas rojas, ~9 son verdaderas. Minimiza fatiga de alarmas |
+| **Recall** | 0.7371 | Detecta casi el 74% de los episodios de riesgo reales |
+| **F1-Score** | 0.7993 | Balance robusto considerando la naturaleza caótica del clima |
 
 ### Tabla de Alerta Operativa (Score 2025-2026)
 
 El artefacto principal del pipeline es `data/07_model_output/score_riesgo_operativo_scte.csv`. Cada fila corresponde a un vuelo en SCTE con su probabilidad de condicion adversa en las proximas 3 horas y una alerta de color para accion inmediata:
 
-| Alerta_Operativa | Probabilidad | Vuelos 2025-2026 | Accion recomendada |
+| Alerta_Operativa | Probabilidad | Vuelos 2025-2026 | Acción recomendada |
 |---|---|---|---|
-| **Verde (Operacion Normal)** | < 30% | **10 777** (57.7%) | Sin accion. Condiciones dentro de parametros normales |
-| **Amarillo (Monitoreo Preventivo)** | 30% – 70% | **3 466** (18.6%) | Revisar NOTAM, coordinar alternativas, activar protocolo preventivo |
-| **Rojo (Alerta de Retraso)** | > 70% | **4 451** (23.8%) | Activar protocolo de contingencia. Evaluar postergacion o desvio |
+| **Verde (Operación Normal)** | < 30% | **11.363** (60.8%) | Sin acción. Condiciones estables. |
+| **Amarillo (Monitoreo Preventivo)** | 30% – 70% | **2.668** (14.3%) | Revisar NOTAM, preparar protocolos de contingencia. |
+| **Rojo (Alerta de Retraso)** | > 70% | **4.663** (24.9%) | Activar contingencia. Evaluar mangas y personal extra. |
 
 Para ejecutar solo este pipeline:
 

@@ -22,6 +22,7 @@ dependencies = [
     "tensorflow",
     "grpcio-tools",
     "protobuf",
+    "lightgbm>=4.7.0",
 ]
 
 [project.scripts]
